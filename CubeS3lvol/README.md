@@ -383,16 +383,19 @@ endpoint and bucket are read from the COS config file (see the config section).
 For a local MinIO the config must also set `path_style = "true"` and
 `no_tls = "true"` so the S3 client talks plain HTTP with path-style URLs.
 
-### Busy-polling threads and CPU affinity
+### Interrupt-mode reactors and CPU affinity
 
-`s3lvol_tgt` runs SPDK reactor threads in busy-poll mode: they spin at 100% of
-the cores they are pinned to and never sleep. The current deployment starts
-with **2 reactors on the last two allowed CPUs** (for `Cpus_allowed_list: 0-7`
-that is `-m 0xc0`, CPU 6 and CPU 7). Those two cores are fully consumed by the
-target, so **other (application/business) processes must be kept off them** —
-pin them elsewhere with `taskset`/`numactl` (or a cpuset/cgroup) so the
-target's request latency is not disturbed by scheduler contention. Set
-`RCOW_TGT_CPUMASK` to an explicit hex mask when the cores are isolated.
+`s3lvol_tgt` starts SPDK reactors in **interrupt mode** (epoll, not busy-poll).
+Idle nvmf reactors sleep; the owner core still wakes on the WAL batch timer
+(50 µs) and on I/O. `--interrupt-mode` on the command line is redundant.
+
+The current deployment starts with **2 reactors on the last two allowed CPUs**
+(for `Cpus_allowed_list: 0-7` that is `-m 0xc0`, CPU 6 and CPU 7). Those cores
+are no longer 100% busy when idle, but **other (application/business) processes
+must still be kept off them** — pin them elsewhere with `taskset`/`numactl`
+(or a cpuset/cgroup) so the target's request latency is not disturbed by
+scheduler contention. Set `RCOW_TGT_CPUMASK` to an explicit hex mask when the
+cores are isolated.
 
 ## LIMITATIONS and TODOs
 

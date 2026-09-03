@@ -64,6 +64,12 @@ main(int argc, char **argv)
 		return rc == SPDK_APP_PARSE_ARGS_HELP ? 0 : 1;
 	}
 
+	/* Default: reactors sleep on epoll instead of spinning. The dataplane
+	 * (nvmf/tcp, bdev_aio, timed s3lvol pollers, CRT completions via send_msg)
+	 * all have interrupt sources. --interrupt-mode is then a no-op; SPDK
+	 * has no flag to turn this back off. */
+	opts.interrupt_mode = true;
+
 	rc = spdk_app_start(&opts, s3lvol_tgt_started, NULL);
 	if (rc) {
 		SPDK_ERRLOG("spdk_app_start failed: %d\n", rc);

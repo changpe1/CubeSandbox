@@ -8,7 +8,8 @@
 #
 #  Running (credentials are read from the environment):
 #    export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
-#    ./s3lvol_tgt -m 0x3            # needs root (DPDK)
+#    ./s3lvol_tgt                    # interrupt mode is the default
+#    ./s3lvol_tgt -m 0x3             # explicit mask; needs root (DPDK)
 #
 #  === --whole-archive must cover SPDK's own libraries, not just ours ===
 #
