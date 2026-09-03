@@ -26,10 +26,16 @@
  *
  *   === Lifetime ===
  *
- *   destroy() is called by blobstore, when it decides the back device is no
- *   longer referenced. That is why both the manifest and the S3 client are held
- *   by reference here: the import RPC that created this is long gone, and a
- *   release_export may have happened in between.
+ *   destroy() is called by blobstore when it decides the back device is no
+ *   longer referenced -- including blob_set_back_bs_dev() after a decouple,
+ *   which freezes *new* blob I/O and then destroys this device. Freeze does not
+ *   wait for ranged GETs already submitted to S3: their completions bounce back
+ *   via send_msg and still touch this struct. inflight counts those I/Os so
+ *   unregister (and free) wait for the last one, instead of racing it.
+ *
+ *   That is also why both the manifest and the S3 client are held by reference
+ *   here: the import RPC that created this is long gone, and a release_export
+ *   may have happened in between.
  */
 
 #include "spdk/stdinc.h"
@@ -81,6 +87,14 @@ struct s3_export_dev {
 	uint64_t                   bytes_read;
 	uint64_t                   zero_fills;
 	uint64_t                   refetches;
+
+	/* Blobstore I/Os that have not yet called cb_args->cb_fn. Includes a
+	 * refetch/retry of the same I/O. Touched from every submit thread. */
+	uint32_t                   inflight;
+
+	/* LIVE -> DRAIN in destroy(); DRAIN -> GONE exactly once, then unregister.
+	 * New reads are refused once DRAIN. */
+	uint32_t                   life;
 };
 
 /* One bs_dev read, possibly spanning several chunks. */
@@ -119,6 +133,12 @@ struct s3_export_io {
 	bool                        retried;
 
 	TAILQ_ENTRY(s3_export_io)   waiter_link;
+};
+
+enum export_dev_life {
+	EXPORT_DEV_LIVE  = 0,
+	EXPORT_DEV_DRAIN = 1,
+	EXPORT_DEV_GONE  = 2,
 };
 
 struct s3_export_chunk_io {
@@ -179,6 +199,38 @@ export_chunk_key(const struct s3_export_manifest *m, uint64_t chunk_index,
 			    out, out_len);
 }
 
+static void export_io_device_unregistered(void *io_device);
+static void export_try_unregister(struct s3_export_dev *dev);
+
+static void
+export_io_begin(struct s3_export_dev *dev)
+{
+	__atomic_fetch_add(&dev->inflight, 1, __ATOMIC_RELAXED);
+}
+
+static void
+export_io_end(struct s3_export_dev *dev)
+{
+	if (__atomic_sub_fetch(&dev->inflight, 1, __ATOMIC_ACQ_REL) == 0) {
+		export_try_unregister(dev);
+	}
+}
+
+static void
+export_try_unregister(struct s3_export_dev *dev)
+{
+	uint32_t expected = EXPORT_DEV_DRAIN;
+
+	if (__atomic_load_n(&dev->inflight, __ATOMIC_ACQUIRE) != 0) {
+		return;
+	}
+	if (!__atomic_compare_exchange_n(&dev->life, &expected, EXPORT_DEV_GONE,
+					 false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+		return;
+	}
+	spdk_io_device_unregister(dev, export_io_device_unregistered);
+}
+
 /* ==========================================================================
  * Completion
  * ========================================================================== */
@@ -201,6 +253,7 @@ export_io_drop(struct s3_export_io *io)
 static void
 export_io_complete(struct s3_export_io *io)
 {
+	struct s3_export_dev *dev = io->dev;
 	struct spdk_bs_dev_cb_args *cb_args = io->cb_args;
 	int status = io->status;
 
@@ -228,6 +281,7 @@ export_io_complete(struct s3_export_io *io)
 
 	export_io_drop(io);
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, status);
+	export_io_end(dev);
 }
 
 static void
@@ -312,21 +366,41 @@ export_read_internal(struct spdk_bs_dev *bs_dev, struct spdk_io_channel *channel
 	uint64_t remaining = (uint64_t)lba_count * S3LVOL_BLOCK_SIZE;
 	uint8_t *buf = payload;
 
+	(void)channel;
+
+	if (!is_retry &&
+	    __atomic_load_n(&dev->life, __ATOMIC_ACQUIRE) != EXPORT_DEV_LIVE) {
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EIO);
+		return;
+	}
+
 	if (lba + lba_count > bs_dev->blockcnt) {
 		SPDK_ERRLOG("export read out of range: lba=%" PRIu64 " count=%u "
 			    "blockcnt=%" PRIu64 "\n", lba, lba_count, bs_dev->blockcnt);
 		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EINVAL);
+		if (is_retry) {
+			export_io_end(dev);
+		}
 		return;
 	}
 	if (lba_count == 0) {
 		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+		if (is_retry) {
+			export_io_end(dev);
+		}
 		return;
 	}
 
 	io = calloc(1, sizeof(*io));
 	if (!io) {
 		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -ENOMEM);
+		if (is_retry) {
+			export_io_end(dev);
+		}
 		return;
+	}
+	if (!is_retry) {
+		export_io_begin(dev);
 	}
 	io->dev = dev;
 	io->m = __atomic_load_n(&dev->m, __ATOMIC_ACQUIRE);
@@ -659,6 +733,8 @@ static void
 export_destroy(struct spdk_bs_dev *bs_dev)
 {
 	struct s3_export_dev *dev = (struct s3_export_dev *)bs_dev;
+	uint32_t expected = EXPORT_DEV_LIVE;
+	uint32_t inflight;
 
 	SPDK_NOTICELOG("Releasing imported export %s: %" PRIu64 " read(s), "
 		       "%" PRIu64 " bytes from S3, %" PRIu64 " served as zeroes, "
@@ -666,21 +742,20 @@ export_destroy(struct spdk_bs_dev *bs_dev)
 		       dev->m->uuid_str, dev->reads, dev->bytes_read, dev->zero_fills,
 		       dev->refetches);
 
-	/* No wait for a refetch, deliberately.
-	 *
-	 * A refetch only exists while an I/O is waiting on it, and that I/O is one
-	 * blobstore is waiting for a callback on -- so blobstore cannot have decided
-	 * the device is unreferenced. The same reasoning already covers an ordinary
-	 * chunk GET, which writes to dev from its completion.
-	 *
-	 * What that rests on is that every path out of a refetch releases its
-	 * waiters, including each failure: a refetch that returned without doing so
-	 * would leave blobstore waiting for ever, and the leak would look like a
-	 * hung volume rather than like anything to do with this file. */
+	if (!__atomic_compare_exchange_n(&dev->life, &expected, EXPORT_DEV_DRAIN,
+					 false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+		return;
+	}
 
-	/* Frees in the callback: unregistering is asynchronous, and any channel
-	 * still open would otherwise be pointing at freed memory. */
-	spdk_io_device_unregister(dev, export_io_device_unregistered);
+	/* blob_set_back_bs_dev() freezes new I/O and then calls destroy() without
+	 * waiting for ranged GETs already in CRT. Those completions still write
+	 * this device; unregistering here would free it under them. Drain first. */
+	inflight = __atomic_load_n(&dev->inflight, __ATOMIC_ACQUIRE);
+	if (inflight != 0) {
+		SPDK_NOTICELOG("export %s: destroy waiting for %u in-flight read(s)\n",
+			       dev->m->uuid_str, inflight);
+	}
+	export_try_unregister(dev);
 }
 
 /* ==========================================================================
