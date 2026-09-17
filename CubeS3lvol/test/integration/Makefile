@@ -113,6 +113,14 @@ s3_client_test: s3_client_test.c $(STUB_SRCS) $(S3BSDEV_DIR)/libs3bsdev.a
 	    -Wl,--start-group $(STUB_SPDK_LIBS) -Wl,--end-group \
 	    $(TEST_SYS_LIBS) -o $@
 
+# Manual COS GET bandwidth probe. Not part of `make check`.
+s3_get_bench: s3_get_bench.c $(STUB_SRCS) $(S3BSDEV_DIR)/libs3bsdev.a
+	$(CC) $(COMMON_CFLAGS) s3_get_bench.c $(STUB_SRCS) \
+	    $(S3BSDEV_DIR)/libs3bsdev.a \
+	    $(AWS_LIBS) \
+	    -Wl,--start-group $(STUB_SPDK_LIBS) -Wl,--end-group \
+	    $(TEST_SYS_LIBS) -o $@
+
 s3_spawner_test: s3_spawner_test.c $(STUB_SRCS) $(S3BSDEV_DIR)/libs3bsdev.a
 	$(CC) $(COMMON_CFLAGS) s3_spawner_test.c $(STUB_SRCS) \
 	    $(S3BSDEV_DIR)/libs3bsdev.a \
@@ -323,4 +331,4 @@ $(S3BSDEV_DIR)/libs3bsdev.a:
 -include $(APPS:=.d)
 
 clean:
-	rm -f $(APPS) *.o *.d
+	rm -f $(APPS) s3_get_bench *.o *.d
